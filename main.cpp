@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <iostream>
+#include <functional>
 
 using u64 = unsigned long long;
 using u8 = unsigned char;
@@ -15,27 +16,28 @@ int main()
     using namespace boost::asio;
     using namespace boost::asio::ip;
 
+    // create io context and threads.
     boost::asio::io_context ioc;
-
     auto w = std::make_unique<boost::asio::io_context::work>(ioc);
     std::vector<std::thread> thrds(4);
     for (auto& t : thrds)
         t = std::thread([&] { ioc.run(); });
 
-    int port = 1212;
+
+    // setup ssl contex
     boost::asio::ssl::context serverCtx(boost::asio::ssl::context::tlsv13_server);
     boost::asio::ssl::context clientCtx(boost::asio::ssl::context::tlsv13_client);
-
     std::string dir = "./cert";
     auto file = dir + "/ca.cert.pem";
     serverCtx.load_verify_file(file);
     clientCtx.load_verify_file(file);
-
     clientCtx.use_private_key_file(dir + "/client-0.key.pem", boost::asio::ssl::context::file_format::pem);
     clientCtx.use_certificate_file(dir + "/client-0.cert.pem", boost::asio::ssl::context::file_format::pem);
     serverCtx.use_private_key_file(dir + "/server-0.key.pem", boost::asio::ssl::context::file_format::pem);
     serverCtx.use_certificate_file(dir + "/server-0.cert.pem", boost::asio::ssl::context::file_format::pem);
 
+    // bind localhost:1212
+    int port = 1212;
     tcp::acceptor acceptor(ioc);
     tcp::resolver resolver(ioc);
     tcp::endpoint endpoint = *resolver.resolve("localhost", std::to_string(port).c_str());
@@ -44,6 +46,7 @@ int main()
     acceptor.bind(endpoint);
     acceptor.listen(1);
 
+    // connect the sockets
     ssl::stream<tcp::socket> srv(ioc, serverCtx), cli(ioc, clientCtx);
     auto fu = std::async([&] {
         acceptor.accept(srv.lowest_layer());
@@ -53,63 +56,48 @@ int main()
     cli.handshake(ssl::stream_base::client);
     fu.get();
 
-
     io_context::strand srvStrand(ioc), cliStrand(ioc);
-
-
     u64 trials = 100;
-    //std::vector<char> mData(10000);
+    std::atomic<u64> spinLock(4);
 
-    std::atomic<u64> c(0);
-
+    // this function launches a callback chain where
+    // data is send and received `trial` number of times.
     std::function<void(bool, ssl::stream<tcp::socket>&, io_context::strand&, u64)> f =
         [&](bool send, ssl::stream<tcp::socket>& sock, io_context::strand& strand, u64 t) {
-        ++c;
+        
+        // within the strand perform an async_read or async_write
         strand.dispatch([&, send, t]() {
             std::vector<u8> buffer(10000);
-            if (send)
-            {
-                auto bb = const_buffer(buffer.data(), buffer.size());
-                async_write(sock, bb,
-                    [&, send, t, buffer = std::move(buffer)](boost::system::error_code error, std::size_t n) mutable {
-                        if (error)
-                        {
-                            std::cout << error.message() << std::endl;
-                            std::terminate();
-                        }
-                        if (t)
-                            f(send, sock, strand, t - 1);
-                        --c;
-                    });
-            }
-            else
-            {
-                auto bb = mutable_buffer(buffer.data(), buffer.size());
-                async_read(sock, bb,
-                    [&, send, t, buffer = std::move(buffer)](boost::system::error_code error, std::size_t n) mutable {
-                        //callback(error, n/*, s*/);
-                        if (error)
-                        {
-                            std::cout << error.message() << std::endl;
-                            std::terminate();
-                        }
-
-                        if (t)
-                            f(send, sock, strand, t - 1);
-                        --c;
+            auto bb = mutable_buffer(buffer.data(), buffer.size());
+            auto callback = [&, send, t, buffer = std::move(buffer), moveOnly = std::unique_ptr<int>{}](boost::system::error_code error, std::size_t n) mutable {
+                    if (error) {
+                        std::cout << error.message() << std::endl;
+                        std::terminate();
                     }
-                );
-            }
-            });
 
+                    // perform another operation or complete.
+                    if (t)
+                        f(send, sock, strand, t - 1);
+                    else
+                        --spinLock;
+                };
+
+            if (send)
+                async_write(sock, bb, std::move(callback));
+            else
+                async_read(sock, bb, std::move(callback));
+
+        });
     };
 
+    // launch our callback chains.
     f(true, srv, srvStrand, trials);
     f(false, srv, srvStrand, trials);
     f(true, cli, cliStrand, trials);
     f(false, cli, cliStrand, trials);
 
-    while (c);
+    // wait for them to complete and cleanup.
+    while (spinLock);
     w.reset();
     for (auto& t : thrds)
         t.join();
